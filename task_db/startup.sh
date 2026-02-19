@@ -1,12 +1,22 @@
 #!/bin/bash
 
 # Minimal PostgreSQL startup script with full paths
-DB_NAME="myapp"
-DB_USER="appuser"
-DB_PASSWORD="dbuser123"
-DB_PORT="5000"
+#
+# This script is responsible for:
+# 1) Starting PostgreSQL (if not already running)
+# 2) Creating the database + user and granting privileges
+# 3) Creating application schema (users + tasks) for task management with auth ownership
+#
+# NOTE: Preview environment expects the DB to be reachable on port 5001.
+# We keep DB_PORT configurable via environment variable but default it to 5001.
+
+DB_NAME="${DB_NAME:-myapp}"
+DB_USER="${DB_USER:-appuser}"
+DB_PASSWORD="${DB_PASSWORD:-dbuser123}"
+DB_PORT="${DB_PORT:-5001}"
 
 echo "Starting PostgreSQL setup..."
+echo "Config: DB_NAME=${DB_NAME} DB_USER=${DB_USER} DB_PORT=${DB_PORT}"
 
 # Find PostgreSQL version and set paths
 PG_VERSION=$(ls /usr/lib/postgresql/ | head -1)
@@ -23,60 +33,56 @@ if sudo -u postgres ${PG_BIN}/pg_isready -p ${DB_PORT} > /dev/null 2>&1; then
     echo ""
     echo "To connect to the database, use:"
     echo "psql -h localhost -U ${DB_USER} -d ${DB_NAME} -p ${DB_PORT}"
-    
+
     # Check if connection info file exists
     if [ -f "db_connection.txt" ]; then
         echo "Or use: $(cat db_connection.txt)"
     fi
-    
+
     echo ""
-    echo "Script stopped - server already running."
-    exit 0
-fi
+    echo "Ensuring schema exists (users/tasks)..."
+else
+    # Also check if there's a PostgreSQL process running (in case pg_isready fails)
+    if pgrep -f "postgres.*-p ${DB_PORT}" > /dev/null 2>&1; then
+        echo "Found existing PostgreSQL process on port ${DB_PORT}"
+        echo "Attempting to verify connection..."
 
-# Also check if there's a PostgreSQL process running (in case pg_isready fails)
-if pgrep -f "postgres.*-p ${DB_PORT}" > /dev/null 2>&1; then
-    echo "Found existing PostgreSQL process on port ${DB_PORT}"
-    echo "Attempting to verify connection..."
-    
-    # Try to connect and verify the database exists
-    if sudo -u postgres ${PG_BIN}/psql -p ${DB_PORT} -d ${DB_NAME} -c '\q' 2>/dev/null; then
-        echo "Database ${DB_NAME} is accessible."
-        echo "Script stopped - server already running."
-        exit 0
+        # Try to connect and verify the database exists
+        if sudo -u postgres ${PG_BIN}/psql -p ${DB_PORT} -d ${DB_NAME} -c '\q' 2>/dev/null; then
+            echo "Database ${DB_NAME} is accessible."
+        fi
     fi
-fi
 
-# Initialize PostgreSQL data directory if it doesn't exist
-if [ ! -f "/var/lib/postgresql/data/PG_VERSION" ]; then
-    echo "Initializing PostgreSQL..."
-    sudo -u postgres ${PG_BIN}/initdb -D /var/lib/postgresql/data
-fi
-
-# Start PostgreSQL server in background
-echo "Starting PostgreSQL server..."
-sudo -u postgres ${PG_BIN}/postgres -D /var/lib/postgresql/data -p ${DB_PORT} &
-
-# Wait for PostgreSQL to start
-echo "Waiting for PostgreSQL to start..."
-sleep 5
-
-# Check if PostgreSQL is running
-for i in {1..15}; do
-    if sudo -u postgres ${PG_BIN}/pg_isready -p ${DB_PORT} > /dev/null 2>&1; then
-        echo "PostgreSQL is ready!"
-        break
+    # Initialize PostgreSQL data directory if it doesn't exist
+    if [ ! -f "/var/lib/postgresql/data/PG_VERSION" ]; then
+        echo "Initializing PostgreSQL..."
+        sudo -u postgres ${PG_BIN}/initdb -D /var/lib/postgresql/data
     fi
-    echo "Waiting... ($i/15)"
-    sleep 2
-done
 
-# Create database and user
-echo "Setting up database and user..."
-sudo -u postgres ${PG_BIN}/createdb -p ${DB_PORT} ${DB_NAME} 2>/dev/null || echo "Database might already exist"
+    # Start PostgreSQL server in background
+    echo "Starting PostgreSQL server..."
+    sudo -u postgres ${PG_BIN}/postgres -D /var/lib/postgresql/data -p ${DB_PORT} &
 
-# Set up user and permissions with proper schema ownership
-sudo -u postgres ${PG_BIN}/psql -p ${DB_PORT} -d postgres << EOF
+    # Wait for PostgreSQL to start
+    echo "Waiting for PostgreSQL to start..."
+    sleep 5
+
+    # Check if PostgreSQL is running
+    for i in {1..15}; do
+        if sudo -u postgres ${PG_BIN}/pg_isready -p ${DB_PORT} > /dev/null 2>&1; then
+            echo "PostgreSQL is ready!"
+            break
+        fi
+        echo "Waiting... ($i/15)"
+        sleep 2
+    done
+
+    # Create database and user
+    echo "Setting up database and user..."
+    sudo -u postgres ${PG_BIN}/createdb -p ${DB_PORT} ${DB_NAME} 2>/dev/null || echo "Database might already exist"
+
+    # Set up user and permissions with proper schema ownership
+    sudo -u postgres ${PG_BIN}/psql -p ${DB_PORT} -d postgres << EOF
 -- Create user if doesn't exist
 DO \$\$
 BEGIN
@@ -91,7 +97,7 @@ END
 GRANT ALL PRIVILEGES ON DATABASE ${DB_NAME} TO ${DB_USER};
 
 -- Connect to the specific database for schema-level permissions
-\c ${DB_NAME}
+\\c ${DB_NAME}
 
 -- For PostgreSQL 15+, we need to handle public schema permissions differently
 -- First, grant usage on public schema
@@ -106,10 +112,6 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO ${DB_USER};
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON FUNCTIONS TO ${DB_USER};
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TYPES TO ${DB_USER};
 
--- If you want the user to be able to create objects without restrictions,
--- you can make them the owner of the public schema (optional but effective)
--- ALTER SCHEMA public OWNER TO ${DB_USER};
-
 -- Alternative: Grant all privileges on schema public to the user
 GRANT ALL ON SCHEMA public TO ${DB_USER};
 
@@ -119,21 +121,55 @@ GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO ${DB_USER};
 GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public TO ${DB_USER};
 EOF
 
-# Additionally, connect to the specific database to ensure permissions
-sudo -u postgres ${PG_BIN}/psql -p ${DB_PORT} -d ${DB_NAME} << EOF
+    # Additionally, connect to the specific database to ensure permissions
+    sudo -u postgres ${PG_BIN}/psql -p ${DB_PORT} -d ${DB_NAME} << EOF
 -- Double-check permissions are set correctly in the target database
 GRANT ALL ON SCHEMA public TO ${DB_USER};
 GRANT CREATE ON SCHEMA public TO ${DB_USER};
 
 -- Show current permissions for debugging
-\dn+ public
+\\dn+ public
 EOF
+fi
 
-# Save connection command to a file
+# ---------------------------------------------------------------------------
+# Application schema (auth + task management)
+#
+# Requirements:
+# - Users table with unique email
+# - Tasks owned by a user (auth ownership)
+# - Enforce cascade delete of tasks when user deleted
+# - Timestamps and basic constraints
+# - Indexes for common queries (owner_id, status, updated_at)
+# ---------------------------------------------------------------------------
+echo "Creating/Updating application schema (users/tasks)..."
+
+# We create the pgcrypto extension to support gen_random_uuid().
+# Use separate calls per statement for reliability and easier debugging.
+sudo -u postgres ${PG_BIN}/psql -p ${DB_PORT} -d ${DB_NAME} -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS pgcrypto;"
+sudo -u postgres ${PG_BIN}/psql -p ${DB_PORT} -d ${DB_NAME} -v ON_ERROR_STOP=1 -c "CREATE TABLE IF NOT EXISTS users (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), email text NOT NULL UNIQUE, password_hash text NOT NULL, display_name text, created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now());"
+sudo -u postgres ${PG_BIN}/psql -p ${DB_PORT} -d ${DB_NAME} -v ON_ERROR_STOP=1 -c "CREATE TABLE IF NOT EXISTS tasks (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), owner_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE, title text NOT NULL, description text, status text NOT NULL DEFAULT 'todo' CHECK (status IN ('todo','in_progress','done')), due_date date, created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now());"
+
+# Helpful indexes
+sudo -u postgres ${PG_BIN}/psql -p ${DB_PORT} -d ${DB_NAME} -v ON_ERROR_STOP=1 -c "CREATE INDEX IF NOT EXISTS idx_tasks_owner_id ON tasks(owner_id);"
+sudo -u postgres ${PG_BIN}/psql -p ${DB_PORT} -d ${DB_NAME} -v ON_ERROR_STOP=1 -c "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);"
+sudo -u postgres ${PG_BIN}/psql -p ${DB_PORT} -d ${DB_NAME} -v ON_ERROR_STOP=1 -c "CREATE INDEX IF NOT EXISTS idx_tasks_updated_at ON tasks(updated_at);"
+
+# Trigger to auto-update updated_at timestamps on updates
+sudo -u postgres ${PG_BIN}/psql -p ${DB_PORT} -d ${DB_NAME} -v ON_ERROR_STOP=1 -c "CREATE OR REPLACE FUNCTION set_updated_at() RETURNS trigger AS \$\$ BEGIN NEW.updated_at = now(); RETURN NEW; END; \$\$ LANGUAGE plpgsql;"
+sudo -u postgres ${PG_BIN}/psql -p ${DB_PORT} -d ${DB_NAME} -v ON_ERROR_STOP=1 -c "DO \$\$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_users_updated_at') THEN CREATE TRIGGER trg_users_updated_at BEFORE UPDATE ON users FOR EACH ROW EXECUTE FUNCTION set_updated_at(); END IF; END \$\$;"
+sudo -u postgres ${PG_BIN}/psql -p ${DB_PORT} -d ${DB_NAME} -v ON_ERROR_STOP=1 -c "DO \$\$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_tasks_updated_at') THEN CREATE TRIGGER trg_tasks_updated_at BEFORE UPDATE ON tasks FOR EACH ROW EXECUTE FUNCTION set_updated_at(); END IF; END \$\$;"
+
+# Ensure app user can access created objects
+sudo -u postgres ${PG_BIN}/psql -p ${DB_PORT} -d ${DB_NAME} -v ON_ERROR_STOP=1 -c "GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO ${DB_USER};"
+sudo -u postgres ${PG_BIN}/psql -p ${DB_PORT} -d ${DB_NAME} -v ON_ERROR_STOP=1 -c "GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO ${DB_USER};"
+sudo -u postgres ${PG_BIN}/psql -p ${DB_PORT} -d ${DB_NAME} -v ON_ERROR_STOP=1 -c "GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public TO ${DB_USER};"
+
+# Save connection command to a file (authoritative for other tooling)
 echo "psql postgresql://${DB_USER}:${DB_PASSWORD}@localhost:${DB_PORT}/${DB_NAME}" > db_connection.txt
 echo "Connection string saved to db_connection.txt"
 
-# Save environment variables to a file
+# Save environment variables to a file for db_visualizer
 cat > db_visualizer/postgres.env << EOF
 export POSTGRES_URL="postgresql://localhost:${DB_PORT}/${DB_NAME}"
 export POSTGRES_USER="${DB_USER}"
@@ -147,10 +183,9 @@ echo "Database: ${DB_NAME}"
 echo "User: ${DB_USER}"
 echo "Port: ${DB_PORT}"
 echo ""
-
 echo "Environment variables saved to db_visualizer/postgres.env"
 echo "To use with Node.js viewer, run: source db_visualizer/postgres.env"
-
+echo ""
 echo "To connect to the database, use one of the following commands:"
 echo "psql -h localhost -U ${DB_USER} -d ${DB_NAME} -p ${DB_PORT}"
 echo "$(cat db_connection.txt)"
